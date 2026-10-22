@@ -1,0 +1,408 @@
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Instance Number (1-10)'
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: System Information
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        Write-Host "=== ENIGMANO RDP DEPLOYMENT ===" -ForegroundColor Green
+        Write-Host "Instance: ${{ inputs.instance_number }}" -ForegroundColor Yellow
+        Write-Host "Runner: $env:RUNNER_NAME" -ForegroundColor Yellow
+        Write-Host "Workflow: $env:GITHUB_WORKFLOW" -ForegroundColor Yellow
+
+        Write-Host "`n=== SYSTEM SPECIFICATIONS ===" -ForegroundColor Cyan
+
+        Get-ComputerInfo |
+          Select-Object WindowsProductName, WindowsVersion, OsBuildNumber, OsArchitecture |
+          Format-List
+
+        Get-CimInstance Win32_Processor |
+          Select-Object Name, NumberOfCores, NumberOfLogicalProcessors |
+          Format-List
+
+        $os = Get-CimInstance Win32_OperatingSystem
+
+        Write-Host "Total RAM: $([math]::Round($os.TotalVisibleMemorySize / 1MB, 2)) GB"
+        Write-Host "Free RAM:  $([math]::Round($os.FreePhysicalMemory / 1MB, 2)) GB"
+        Write-Host "Process architecture: $env:PROCESSOR_ARCHITECTURE"
+        Write-Host "OS architecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+
+    - name: Enable RDP
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        Write-Host "Configuring Remote Desktop..." -ForegroundColor Green
+
+        Set-ItemProperty `
+          -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+          -Name fDenyTSConnections `
+          -Value 0
+
+        Set-ItemProperty `
+          -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          -Name UserAuthentication `
+          -Value 1
+
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+        Write-Host "RDP configuration completed."
+
+    - name: Create User Account
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $username = "runneradmin"
+        $plainPassword = "P@ssw0rd!"
+        $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+
+        $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+        if ($null -eq $user) {
+          New-LocalUser `
+            -Name $username `
+            -Password $securePassword `
+            -Description "RDP account"
+        } else {
+          Set-LocalUser -Name $username -Password $securePassword
+        }
+
+        Add-LocalGroupMember `
+          -Group "Administrators" `
+          -Member $username `
+          -ErrorAction SilentlyContinue
+
+        Add-LocalGroupMember `
+          -Group "Remote Desktop Users" `
+          -Member $username `
+          -ErrorAction SilentlyContinue
+
+        Write-Host "Username: runneradmin" -ForegroundColor Yellow
+        Write-Host "Password: P@ssw0rd!" -ForegroundColor Yellow
+
+    - name: Install Tailscale ARM64
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+        $ProgressPreference = "SilentlyContinue"
+
+        $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+
+        Write-Host "Detected OS architecture: $architecture"
+
+        switch ($architecture) {
+          "Arm64" {
+            $packageArch = "arm64"
+          }
+          "X64" {
+            $packageArch = "amd64"
+          }
+          default {
+            throw "Unsupported Windows architecture: $architecture"
+          }
+        }
+
+        $version = "1.104.2"
+        $installerPath = Join-Path $env:TEMP "tailscale-setup.msi"
+        $logPath = Join-Path $env:TEMP "tailscale-install.log"
+
+        $downloadUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$version-$packageArch.msi"
+
+        Write-Host "Downloading Tailscale $version ($packageArch)..."
+
+        Invoke-WebRequest `
+          -Uri $downloadUrl `
+          -OutFile $installerPath
+
+        if (!(Test-Path $installerPath)) {
+          throw "Tailscale installer download failed."
+        }
+
+        if ((Get-Item $installerPath).Length -lt 100000) {
+          throw "The downloaded installer is unexpectedly small."
+        }
+
+        $install = Start-Process `
+          -FilePath "msiexec.exe" `
+          -ArgumentList @(
+            "/i",
+            "`"$installerPath`"",
+            "/qn",
+            "/norestart",
+            "/l*v",
+            "`"$logPath`""
+          ) `
+          -Wait `
+          -PassThru
+
+        if ($install.ExitCode -notin @(0, 3010)) {
+          Get-Content $logPath -Tail 50 -ErrorAction SilentlyContinue
+          throw "Tailscale installation failed with exit code $($install.ExitCode)."
+        }
+
+        $tsExe = @(
+          "$env:ProgramFiles\Tailscale\tailscale.exe",
+          "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+        ) |
+          Where-Object { $_ -and (Test-Path $_) } |
+          Select-Object -First 1
+
+        if (-not $tsExe) {
+          $command = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+          if ($command) {
+            $tsExe = $command.Source
+          }
+        }
+
+        if (-not $tsExe) {
+          throw "Installation finished but tailscale.exe was not found."
+        }
+
+        "TAILSCALE_EXE=$tsExe" | Out-File $env:GITHUB_ENV -Append
+
+        & $tsExe version
+
+        if ($LASTEXITCODE -ne 0) {
+          throw "Could not run tailscale.exe."
+        }
+
+        Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+        Write-Host "Tailscale installation verified." -ForegroundColor Green
+
+    - name: Start and Verify Tailscale
+      shell: powershell
+      env:
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $tsExe = $env:TAILSCALE_EXE
+
+        if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+          throw "Missing repository secret TAILSCALE_AUTH_KEY. Add a valid Tailscale authentication key in repository Actions secrets."
+        }
+
+        if (-not $tsExe -or -not (Test-Path $tsExe)) {
+          throw "Tailscale executable was not found."
+        }
+
+        $service = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+
+        if ($service -and $service.Status -ne "Running") {
+          Start-Service -Name "Tailscale"
+        }
+
+        $connected = $false
+
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+          Write-Host "Tailscale connection attempt $attempt of 3..."
+
+          & $tsExe up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=enigmano-${{ github.run_id }}" `
+            "--accept-dns=false"
+
+          if ($LASTEXITCODE -eq 0) {
+            for ($check = 1; $check -le 6; $check++) {
+              Start-Sleep -Seconds 5
+
+              $ipOutput = & $tsExe ip -4 2>$null
+
+              if ($LASTEXITCODE -eq 0) {
+                $ip = ($ipOutput | Select-Object -First 1).ToString().Trim()
+
+                if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                  $connected = $true
+                  break
+                }
+              }
+            }
+          }
+
+          if ($connected) {
+            break
+          }
+
+          Start-Sleep -Seconds 5
+        }
+
+        if (-not $connected) {
+          Write-Host "Tailscale diagnostic status:"
+          & $tsExe status
+          throw "Tailscale did not provide an IPv4 address. Check authentication, service status and runner network access."
+        }
+
+        "TAILSCALE_IP=$ip" | Out-File $env:GITHUB_ENV -Append
+
+        Write-Host "Tailscale IPv4: $ip" -ForegroundColor Green
+        & $tsExe status
+
+    - name: Install Google Chrome
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+        $ProgressPreference = "SilentlyContinue"
+
+        $url = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+        $installer = Join-Path $env:TEMP "chrome_installer.exe"
+
+        Write-Host "Downloading Chrome..."
+        Invoke-WebRequest -Uri $url -OutFile $installer
+
+        $process = Start-Process `
+          -FilePath $installer `
+          -ArgumentList "/silent /install" `
+          -Wait `
+          -PassThru
+
+        Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+        if ($process.ExitCode -notin @(0, 3010)) {
+          throw "Chrome installation returned exit code $($process.ExitCode). Check ARM64 compatibility."
+        }
+
+        Write-Host "Chrome installation step completed."
+
+    - name: Install 7-Zip
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $sevenZip = @(
+          "$env:ProgramFiles\7-Zip\7z.exe",
+          "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+        ) |
+          Where-Object { $_ -and (Test-Path $_) } |
+          Select-Object -First 1
+
+        if (-not $sevenZip) {
+          $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+          if ($winget) {
+            Write-Host "Installing 7-Zip using Windows Package Manager..."
+
+            & $winget.Source install `
+              --id 7zip.7zip `
+              --exact `
+              --silent `
+              --accept-package-agreements `
+              --accept-source-agreements `
+              --disable-interactivity
+
+            if ($LASTEXITCODE -notin @(0, -1978335189)) {
+              Write-Warning "winget returned exit code $LASTEXITCODE."
+            }
+          }
+        }
+
+        $sevenZip = @(
+          "$env:ProgramFiles\7-Zip\7z.exe",
+          "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+        ) |
+          Where-Object { $_ -and (Test-Path $_) } |
+          Select-Object -First 1
+
+        if ($sevenZip) {
+          Write-Host "7-Zip executable: $sevenZip"
+          & $sevenZip
+        } else {
+          Write-Warning "7-Zip was not found. Check package availability for this ARM64 image."
+        }
+
+    - name: Connection Details
+      shell: powershell
+      run: |
+        Write-Host ""
+        Write-Host "=== CONNECTION DETAILS (TAILSCALE) ===" -ForegroundColor Green
+        Write-Host "======================================" -ForegroundColor Cyan
+        Write-Host "ENIGMANO RDP ACCESS" -ForegroundColor Cyan
+        Write-Host "Host: $env:TAILSCALE_IP" -ForegroundColor White
+        Write-Host "Username: runneradmin" -ForegroundColor White
+        Write-Host "Password: P@ssw0rd!" -ForegroundColor Yellow
+        Write-Host "======================================" -ForegroundColor Cyan
+
+        Write-Host ""
+        Write-Host "1. Install Tailscale on your device."
+        Write-Host "2. Sign in to the same authorized Tailscale network."
+        Write-Host "3. Open your Remote Desktop client."
+        Write-Host "4. Connect using the Tailscale IP shown above."
+        Write-Host "5. Use the username and password displayed above."
+
+    - name: Keep Session Alive
+      shell: powershell
+      env:
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        $ErrorActionPreference = "Continue"
+
+        $tsExe = $env:TAILSCALE_EXE
+        $counter = 0
+
+        if (-not $tsExe -or -not (Test-Path $tsExe)) {
+          throw "Tailscale executable is unavailable."
+        }
+
+        Write-Host "Session monitoring started."
+
+        while ($true) {
+          $counter++
+
+          Write-Host "Heartbeat #$counter - $(Get-Date)"
+
+          $service = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+
+          if ($service -and $service.Status -ne "Running") {
+            Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+          }
+
+          $ipOutput = & $tsExe ip -4 2>$null
+
+          if ($LASTEXITCODE -eq 0 -and $ipOutput) {
+            $currentIP = ($ipOutput | Select-Object -First 1).ToString().Trim()
+
+            if ($currentIP -match '^\d{1,3}(\.\d{1,3}){3}$') {
+              Write-Host "Tailscale IPv4: $currentIP" -ForegroundColor Green
+            } else {
+              Write-Warning "Tailscale did not return a valid IPv4 address."
+            }
+          } else {
+            Write-Warning "Tailscale is not reporting an IPv4 address."
+
+            if (-not [string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              & $tsExe up `
+                "--authkey=$env:TAILSCALE_AUTH_KEY" `
+                "--hostname=enigmano-${{ github.run_id }}" `
+                "--accept-dns=false"
+
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Tailscale reconnect attempt failed."
+              }
+            }
+          }
+
+          Start-Sleep -Seconds 60
+        }
